@@ -1,0 +1,23 @@
+# secrets
+.env
+
+# python
+.venv/
+__pycache__/
+*.pyc
+
+# outputs / logs
+outputs/
+*.log
+
+# OS
+.DS_Store
+
+# Local runtime/cache
+tmp/
+tmp/**
+
+# Playwright user data dirs (if you ever use these names)
+**/newsnow_profile/
+**/playwright_profile/
+**/playwright-user-data/
