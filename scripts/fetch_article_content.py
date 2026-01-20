@@ -1,37 +1,52 @@
 #!/usr/bin/env python3
-"""
-fetch_article_content.py (v9)
+"""fetch_article_content.py (v10)
 
-Purpose
-- Fetch and extract article text/metadata for URLs we have already resolved via resolve_newsnow_links.py.
-- Writes results into public.article_extractions (DB mode) OR outputs a CSV (CSV mode).
+Option B storage model (recommended)
+-----------------------------------
+Store ONE row per unique *cleaned* article URL ("clean_url") and maintain a
+separate mapping table that links each NewsNow tracking_url (or other input)
+to that article row.
 
-Key design choices (MVP-friendly)
-- Inputs in DB mode come from public.url_resolutions (status='ok') joined to raw_items for id/title.
-  We do NOT scrape arbitrary raw_items URLs directly.
-- Never downgrades an 'ok' extraction to a failure on reruns.
-- Exponential backoff + max-attempts to avoid hammering paywalled/WAF-protected publishers.
-- Optional Playwright fallback and DuckDuckGo search fallback.
-- Optional caching by fetch_url within a run (big win when multiple raw_items resolve to the same final_url).
+Tables created (if missing)
+---------------------------
+1) public.article_pages
+   - 1 row per unique clean_url
+2) public.article_page_sources
+   - 1 row per tracking_url (input) mapping to article_pages.id
 
-Typical usage (DB mode)
-  python scripts/fetch_article_content.py --db --limit 200 --concurrency 1 ^
-    --use-playwright-fallback --search-fallback ^
-    --playwright-profile-dir .\\tmp\\publisher_profile ^
-    --delay-min 10 --delay-max 25 ^
-    --min-words 120 --max-attempts 5 ^
+Inputs
+------
+DB mode reads from public.url_resolutions (status='ok') and joins raw_items
+for title/content_snip *only for better search fallback*.
+
+CSV mode reads a CSV with at least one of these columns:
+  - final_url (preferred) OR url OR resolved_url OR fetch_url
+  - tracking_url optional
+  - title optional
+
+Key improvements vs v9
+----------------------
+- URL hygiene: strips common tracking/share params (share=linkedin, utm_*, fbclid, gclid, ito, ...)
+- Social-share unwrapping (if a share URL is encountered)
+- True de-dupe: fetch/extract once per clean_url; map many inputs to one article row
+- More aggressive rejection of non-article destinations for search fallback
+- Never overwrites a good (ok) article with a worse result
+
+Typical DB usage
+----------------
+  python scripts/fetch_article_content.py --db --limit 200 --concurrency 1 \
+    --use-playwright-fallback --search-fallback \
+    --playwright-profile-dir .\\tmp\\publisher_profile \
+    --delay-min 10 --delay-max 25 \
+    --min-words 140 --max-attempts 5 \
     --dotenv-path .env
 
-CSV mode expects at least:
-- final_url (preferred) or fetch_url/resolved_url/url columns
-- optional title column for search fallback
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import dataclasses
 import hashlib
 import json
 import os
@@ -41,9 +56,9 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
-from urllib.parse import parse_qs, quote_plus, urlparse, urlunparse
+from urllib.parse import parse_qs, quote_plus, urlencode, urlparse, urlunparse
 
-# Optional imports (only used in relevant modes)
+# Optional imports
 try:
     import pandas as pd  # type: ignore
 except Exception:
@@ -59,18 +74,17 @@ try:
 except Exception as e:
     raise SystemExit("Missing dependency 'beautifulsoup4'. Install with: python -m pip install beautifulsoup4 lxml") from e
 
-# trafilatura is the primary extractor
+# trafilatura is optional; we fall back to soup extraction if absent
 try:
     import trafilatura  # type: ignore
-except Exception as e:
-    raise SystemExit("Missing dependency 'trafilatura'. Install with: python -m pip install trafilatura") from e
+except Exception:
+    trafilatura = None  # type: ignore
 
-# DB deps
 try:
     import psycopg2  # type: ignore
     import psycopg2.extras  # type: ignore
-except Exception:
-    psycopg2 = None  # type: ignore
+except Exception as e:
+    raise SystemExit("Missing dependency 'psycopg2-binary'. Install with: python -m pip install psycopg2-binary") from e
 
 try:
     from dotenv import load_dotenv  # type: ignore
@@ -79,52 +93,46 @@ except Exception:
 
 
 # -----------------------------
-# Detection heuristics
+# URL hygiene & classification
 # -----------------------------
 
-BLOCK_HTTP_STATUSES = {401, 403, 405, 408, 418, 429, 451, 500, 502, 503, 504}
+BAD_NETLOCS = {
+    "twitter.com", "x.com", "www.twitter.com", "www.x.com",
+    "facebook.com", "www.facebook.com",
+    "linkedin.com", "www.linkedin.com",
+    "t.co",
+    "newsnow.co.uk", "www.newsnow.co.uk", "c.newsnow.co.uk",
+}
 
-WAF_STRONG_MARKERS = [
-    # Cloudflare / common WAF & bot challenges
-    "cloudflare",
-    "/cdn-cgi/",
-    "cf-error-code",
-    "cf-ray",
-    "challenge-platform",
-    "just a moment",
-    "attention required",
-    "checking your browser",
-    "ddos protection",
-    "one more step",
-    # Akamai / generic "Access Denied" pages
-    "akamai",
-    "access denied",
-    "reference #",
-    "incident id",
-    # Imperva / Incapsula
-    "incapsula",
-    "imperva",
-    "request unsuccessful",
-    # PerimeterX / DataDome
-    "perimeterx",
-    "px-captcha",
-    "datadome",
-    # Generic blocks
-    "you have been blocked",
-    "unusual traffic",
-    "automated requests",
-    "captcha",
+BAD_URL_PATTERNS = [
+    r"^https?://html\.duckduckgo\.com/",
+    r"^https?://duckduckgo\.com/",
+    r"^https?://(www\.)?google\.com/",
+    r"/intent/tweet",
+    r"/share\?",
+    r"/sharing/share",
+    r"/oauth",
+    r"/login",
+    r"/signin",
+    r"/register",
+    r"/subscribe",
+    r"/paywall",
+    r"/cdn-cgi/",
+    r"/wp-login\.php",
 ]
 
-# Weak markers are *not* sufficient on their own (many modern sites include these in <noscript>).
-WAF_WEAK_MARKERS = [
-    "enable javascript",
-    "enable javascript and cookies",
-    "please enable cookies",
+NON_ARTICLE_PATH_HINTS = [
+    "/privacy",
+    "/cookie",
+    "/cookies",
+    "/terms",
+    "/conditions",
+    "/account",
+    "/signin",
+    "/login",
+    "/subscribe",
 ]
 
-# HTTP statuses that are often returned by WAFs / rate limits. (We still try to extract; status alone doesn't doom it.)
-BLOCK_HTTP_STATUSES = {401, 403, 405, 429, 451, 503}  # 5xx handled separately
 LOGIN_WALL_MARKERS = [
     "subscribe",
     "subscription",
@@ -138,60 +146,71 @@ LOGIN_WALL_MARKERS = [
     "activate your subscription",
 ]
 
-BAD_NETLOCS = {
-    "twitter.com", "x.com", "www.twitter.com", "www.x.com",
-    "facebook.com", "www.facebook.com",
-    "linkedin.com", "www.linkedin.com",
-    "newsnow.co.uk", "www.newsnow.co.uk", "c.newsnow.co.uk",
-    "t.co",
-}
-
-BAD_URL_PATTERNS = [
-    r"^https?://duckduckgo\.com/",
-    r"^https?://(www\.)?google\.com/",
-    r"/share\?",  # social share endpoints
-    r"/intent/tweet",
-    r"/oauth",
-    r"/login",
-    r"/signin",
-    r"/register",
-    r"/subscribe",
-    r"/paywall",
-    r"/cdn-cgi/",
-    r"/wp-login\.php",
+WAF_STRONG_MARKERS = [
+    "cloudflare",
+    "/cdn-cgi/",
+    "cf-error-code",
+    "cf-ray",
+    "challenge-platform",
+    "just a moment",
+    "attention required",
+    "checking your browser",
+    "ddos protection",
+    "one more step",
+    "access denied",
+    "reference #",
+    "incident id",
+    "incapsula",
+    "imperva",
+    "datadome",
+    "perimeterx",
+    "px-captcha",
+    "captcha",
+    "you have been blocked",
+    "unusual traffic",
+    "automated requests",
 ]
 
-PDF_CT_MARKERS = ("application/pdf", "application/x-pdf")
-HTML_CT_MARKERS = ("text/html", "application/xhtml+xml")
+WAF_WEAK_MARKERS = [
+    "enable javascript",
+    "enable javascript and cookies",
+    "please enable cookies",
+]
+
+BLOCK_HTTP_STATUSES = {401, 403, 405, 408, 418, 429, 451, 500, 502, 503, 504}
+
+
+TRACKING_QUERY_KEYS = {
+    "fbclid", "gclid", "dclid", "msclkid",
+    "mc_cid", "mc_eid",
+    "ito",  # metro / share tracking
+    "cmpid", "cmp", "ocid", "icid",
+    "ref", "ref_src", "referrer", "source",
+    "smid", "spm",
+    "share",  # only removed for known values; see logic
+}
+
+TRACKING_QUERY_PREFIXES = ("utm_", "__", "ga_")
+
+SHARE_PARAM_VALUES_TO_STRIP = {"linkedin", "twitter", "x", "facebook"}
 
 
 def normalize_url(url: str) -> str:
-    """Basic normalization: strip fragments, trim whitespace."""
     if not url:
         return url
     url = url.strip()
     try:
         p = urlparse(url)
-        # strip fragment; keep query
-        p2 = p._replace(fragment="")
-        return urlunparse(p2)
+        return urlunparse(p._replace(fragment=""))
     except Exception:
         return url
-
-
-def looks_like_pdf(url: str, content_type: Optional[str]) -> bool:
-    u = (url or "").lower()
-    ct = (content_type or "").lower()
-    if u.split("?")[0].endswith(".pdf"):
-        return True
-    return any(m in ct for m in PDF_CT_MARKERS)
 
 
 def is_bad_destination(url: str) -> bool:
     if not url:
         return True
     p = urlparse(url)
-    nl = p.netloc.lower()
+    nl = (p.netloc or "").lower()
     if nl in BAD_NETLOCS:
         return True
     low = url.lower()
@@ -203,88 +222,139 @@ def is_bad_destination(url: str) -> bool:
     return False
 
 
+def unwrap_social_share(url: str) -> str:
+    """If a URL is a social share wrapper, try to unwrap its target."""
+    if not url:
+        return url
+    p = urlparse(url)
+    host = (p.netloc or "").lower()
+    qs = parse_qs(p.query)
+
+    # LinkedIn share wrappers
+    if "linkedin.com" in host and ("url" in qs or "mini" in qs):
+        u = (qs.get("url") or [None])[0]
+        if u:
+            return u
+
+    # X/Twitter intent
+    if ("twitter.com" in host or "x.com" in host) and ("url" in qs or "text" in qs):
+        u = (qs.get("url") or [None])[0]
+        if u:
+            return u
+
+    return url
+
+
+def clean_url(url: str) -> str:
+    """Normalize + remove obvious tracking/share params without breaking article IDs."""
+    if not url:
+        return url
+    url = unwrap_social_share(normalize_url(url))
+    try:
+        p = urlparse(url)
+        q = parse_qs(p.query, keep_blank_values=True)
+
+        kept: Dict[str, List[str]] = {}
+        for k, vals in q.items():
+            kl = k.lower()
+
+            # strip utm_*, ga_*, __* etc
+            if kl.startswith(TRACKING_QUERY_PREFIXES):
+                continue
+
+            # strip known tracking keys
+            if kl in TRACKING_QUERY_KEYS:
+                if kl == "share":
+                    # remove only if value indicates social sharing
+                    v0 = (vals[0] if vals else "").lower()
+                    if v0 in SHARE_PARAM_VALUES_TO_STRIP or "linkedin" in v0 or "twitter" in v0:
+                        continue
+                    kept[k] = vals
+                else:
+                    continue
+
+            else:
+                kept[k] = vals
+
+        new_query = urlencode(kept, doseq=True)
+        p2 = p._replace(query=new_query, fragment="")
+        return urlunparse(p2)
+    except Exception:
+        return normalize_url(url)
+
+
 def base_domain_from_netloc(netloc: str) -> str:
-    """
-    Heuristic base domain for site-restricted search.
-    Handles common UK 2nd-level TLDs.
-    """
-    host = netloc.lower().split(":")[0]
+    host = (netloc or "").lower().split(":")[0]
     parts = [p for p in host.split(".") if p]
     if len(parts) <= 2:
         return host
     uk_2l = {"co.uk", "org.uk", "gov.uk", "ac.uk", "nhs.uk", "ltd.uk", "plc.uk"}
     last2 = ".".join(parts[-2:])
     last3 = ".".join(parts[-3:])
-    if last3 in uk_2l:
-        # e.g. something.bbc.co.uk -> bbc.co.uk (4 parts)
-        return ".".join(parts[-4:]) if len(parts) >= 4 else host
-    # general case: last2
-    return ".".join(parts[-2:])
+    if last3 in uk_2l and len(parts) >= 4:
+        return ".".join(parts[-4:])
+    return last2
 
 
-def detect_blocked(http_status: Optional[int], html: str, *, return_markers: bool = False):
-    """Heuristic WAF/challenge detection.
-
-    Key design goal: avoid false positives.
-    Many legit sites include 'enable javascript' in <noscript> or cookie banners.
-    We only classify as blocked when:
-      - status code strongly suggests blocking (401/403/429/503 etc), OR
-      - we match at least one STRONG marker, OR
-      - we match multiple weak markers together with other signals.
-
-    Returns:
-      - bool by default
-      - (bool, matched_markers, score) if return_markers=True
-    """
+def detect_blocked(http_status: Optional[int], html: str) -> bool:
     h = (html or "")[:120_000].lower()
-
-    matched: list[str] = []
     score = 0
-
     if http_status is not None and http_status in BLOCK_HTTP_STATUSES:
         score += 2
-        matched.append(f"status:{http_status}")
-
     for s in WAF_STRONG_MARKERS:
         if s in h:
             score += 2
-            matched.append(s)
-
-    weak_hits = 0
-    for w in WAF_WEAK_MARKERS:
-        if w in h:
-            weak_hits += 1
-            matched.append(w)
-
-    # Weak markers only count if there are multiple of them, or combined with other signals.
+    weak_hits = sum(1 for w in WAF_WEAK_MARKERS if w in h)
     if weak_hits >= 2:
         score += 1
-
-    blocked = score >= 2  # at least one strong signal
-    if return_markers:
-        return blocked, matched, score
-    return blocked
+    return score >= 2
 
 
 def detect_login_wall(html: str) -> bool:
-    h = (html or "")[:40_000].lower()
+    h = (html or "")[:60_000].lower()
     for m in LOGIN_WALL_MARKERS:
         if m in h:
             return True
-    # very common "metered paywall" JS markers
     if "paywall" in h and ("subscribe" in h or "sign in" in h):
         return True
     return False
 
 
+def looks_like_non_article(url: str, title: str, text: str) -> bool:
+    """Heuristic: reject obvious legal/login pages that sometimes appear in fallback."""
+    u = (url or "").lower()
+    t = (title or "").lower()
+    if any(seg in u for seg in NON_ARTICLE_PATH_HINTS):
+        # if content is thin, it's very likely not an article
+        if word_count(text) < 80:
+            return True
+    if t in {"terms & conditions", "terms and conditions", "privacy policy", "cookie policy"}:
+        return True
+    if "linkedin login" in t or "sign in | linkedin" in t:
+        return True
+    return False
+
+
+def word_count(text: str) -> int:
+    return len(re.findall(r"\w+", text or ""))
+
+
+def to_hash(text: str) -> Optional[str]:
+    if not text:
+        return None
+    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+
+
+# -----------------------------
+# Extraction
+# -----------------------------
+
+
 def soup_fallback_extract(html: str) -> str:
-    """Last-resort extraction by stripping common chrome/boilerplate."""
     soup = BeautifulSoup(html, "lxml")
-    # remove script/style/nav/footer
     for sel in ["script", "style", "nav", "footer", "header", "noscript", "aside"]:
         for tag in soup.select(sel):
             tag.decompose()
-    # try common content containers first
     for sel in [
         "article",
         "main",
@@ -298,11 +368,10 @@ def soup_fallback_extract(html: str) -> str:
             txt = node.get_text("\n", strip=True)
             if txt:
                 return txt
-    txt = soup.get_text("\n", strip=True)
-    return txt
+    return soup.get_text("\n", strip=True)
 
 
-def extract_canonical_url(html: str, base_url: str) -> Optional[str]:
+def extract_canonical_url(html: str) -> Optional[str]:
     try:
         soup = BeautifulSoup(html, "lxml")
         link = soup.find("link", rel=lambda v: v and "canonical" in v.lower())
@@ -310,19 +379,14 @@ def extract_canonical_url(html: str, base_url: str) -> Optional[str]:
             href = link["href"].strip()
             if href.startswith("http"):
                 return href
-            # relative canonical
-            b = urlparse(base_url)
-            return urlunparse(b._replace(path=href))
     except Exception:
         return None
     return None
 
 
 def extract_with_trafilatura(html: str, url: str) -> Tuple[str, Dict[str, Any]]:
-    """
-    Returns: (text, meta_dict)
-    meta_dict keys may include: title, author, date, sitename, language, url
-    """
+    if trafilatura is None:
+        return "", {}
     downloaded = trafilatura.extract(
         html,
         url=url,
@@ -347,65 +411,37 @@ def extract_with_trafilatura(html: str, url: str) -> Tuple[str, Dict[str, Any]]:
         }
         return text, meta
     except Exception:
-        # fallback to plain text
         txt = (trafilatura.extract(html, url=url, output_format="txt") or "").strip()
         return txt, {}
 
 
-def pick_search_candidate(cands: Sequence[str], desired_base_domain: Optional[str]) -> Optional[str]:
-    for u in cands:
-        if not u or not u.startswith("http"):
-            continue
-        if is_bad_destination(u):
-            continue
-        if u.lower().split("?")[0].endswith(".pdf"):
-            continue
-        if desired_base_domain:
-            nl = urlparse(u).netloc.lower()
-            if desired_base_domain not in nl:
-                continue
-        return u
-    return None
-
-
 # -----------------------------
-# Settings and retry policy
+# HTTP, Search, Playwright
 # -----------------------------
+
 
 @dataclass
 class Settings:
     timeout_s: float = 25.0
     proxy: Optional[str] = None
-    user_agent: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36"
+    user_agent: str = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0 Safari/537.36"
+    )
 
-    # pacing
     delay_min: float = 0.0
     delay_max: float = 0.0
 
-    # fallbacks
     use_playwright_fallback: bool = False
     playwright_profile_dir: Optional[str] = None
     playwright_headless: bool = True
     search_fallback: bool = False
 
-    # extraction tuning
-    min_words: int = 120
-    prefer_html_over_pdf: bool = True
-    enable_pdf: bool = False
-
-    # reliability
-    cache_by_url: bool = True
+    min_words: int = 140
     max_attempts: int = 5
     retry_base_minutes: int = 60
     retry_max_hours: int = 48
-
-
-def sleep_jitter(settings: Settings) -> asyncio.Future:
-    if settings.delay_max <= 0:
-        return asyncio.sleep(0)
-    lo = max(0.0, settings.delay_min)
-    hi = max(lo, settings.delay_max)
-    return asyncio.sleep(random.uniform(lo, hi))
 
 
 def compute_next_retry(status: str, attempts_total: int, settings: Settings) -> Optional[datetime]:
@@ -414,35 +450,14 @@ def compute_next_retry(status: str, attempts_total: int, settings: Settings) -> 
     if attempts_total >= settings.max_attempts:
         return None
     base = settings.retry_base_minutes
-    # Make blocked/login wall back off harder
     if status in {"blocked", "login_wall"}:
         base = int(base * 3)
-    # Exponential with cap
     exp = min(max(attempts_total - 1, 0), 8)
-    minutes = min(base * (2 ** exp), settings.retry_max_hours * 60)
+    minutes = min(base * (2**exp), settings.retry_max_hours * 60)
     return datetime.now(timezone.utc) + timedelta(minutes=minutes)
 
 
-def word_count(text: str) -> int:
-    return len(re.findall(r"\w+", text or ""))
-
-
-def to_hash(text: str) -> Optional[str]:
-    if not text:
-        return None
-    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
-
-
-# -----------------------------
-# HTTP + Playwright + Search
-# -----------------------------
-
 def build_async_client(settings: Settings, headers: Dict[str, str]) -> httpx.AsyncClient:
-    """
-    Create an httpx.AsyncClient compatible across httpx versions.
-
-    httpx<=0.27 used `proxies=`; httpx>=0.28 uses `proxy=`.
-    """
     kwargs: Dict[str, Any] = {
         "follow_redirects": True,
         "timeout": settings.timeout_s,
@@ -456,7 +471,7 @@ def build_async_client(settings: Settings, headers: Dict[str, str]) -> httpx.Asy
     return httpx.AsyncClient(**kwargs)
 
 
-async def fetch_http(url: str, settings: Settings) -> Tuple[Optional[int], Optional[str], bytes]:
+async def fetch_http(url: str, settings: Settings) -> Tuple[Optional[int], Optional[str], bytes, str]:
     headers = {
         "User-Agent": settings.user_agent,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -467,7 +482,7 @@ async def fetch_http(url: str, settings: Settings) -> Tuple[Optional[int], Optio
     async with build_async_client(settings, headers=headers) as client:
         r = await client.get(url)
         ct = r.headers.get("content-type")
-        return r.status_code, ct, r.content
+        return r.status_code, ct, r.content, str(r.url)
 
 
 async def ddg_search(query: str, settings: Settings, site: Optional[str] = None) -> List[str]:
@@ -484,14 +499,12 @@ async def ddg_search(query: str, settings: Settings, site: Optional[str] = None)
         r = await client.get(url)
         r.raise_for_status()
         html = r.text
-
     soup = BeautifulSoup(html, "lxml")
     urls: List[str] = []
     for a in soup.select("a.result__a"):
-        href = a.get("href")
+        href = (a.get("href") or "").strip()
         if not href:
             continue
-        href = href.strip()
         if "duckduckgo.com/l/?" in href:
             qs = parse_qs(urlparse(href).query)
             u = (qs.get("uddg") or [None])[0]
@@ -499,7 +512,7 @@ async def ddg_search(query: str, settings: Settings, site: Optional[str] = None)
                 urls.append(u)
         else:
             urls.append(href)
-    # de-dupe preserving order
+    # de-dupe
     seen = set()
     out: List[str] = []
     for u in urls:
@@ -511,10 +524,8 @@ async def ddg_search(query: str, settings: Settings, site: Optional[str] = None)
     return out
 
 
-async def fetch_with_playwright(url: str, settings: Settings) -> Tuple[Optional[int], Optional[str], str]:
-    """
-    Returns (status_code, content_type, html)
-    """
+async def fetch_with_playwright(url: str, settings: Settings) -> Tuple[Optional[int], Optional[str], str, str]:
+    """Returns (status_code, content_type, html, final_url)"""
     try:
         from playwright.async_api import async_playwright  # type: ignore
     except Exception as e:
@@ -522,493 +533,549 @@ async def fetch_with_playwright(url: str, settings: Settings) -> Tuple[Optional[
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=settings.playwright_headless)
-        context = await browser.new_context(
-            user_agent=settings.user_agent,
-            viewport={"width": 1280, "height": 800},
-            locale="en-GB",
-            java_script_enabled=True,
-        )
+        context_kwargs: Dict[str, Any] = {}
         if settings.playwright_profile_dir:
-            # Note: Playwright doesn't load Chrome profiles directly; we keep this
-            # arg to maintain CLI compatibility and for future enhancements.
-            pass
-
-        page = await context.new_page()
-        try:
-            resp = await page.goto(url, wait_until="domcontentloaded", timeout=int(settings.timeout_s * 1000))
-            # Give JS redirects / interstitials time to run
-            await page.wait_for_load_state("networkidle", timeout=int(settings.timeout_s * 1000))
-            html = await page.content()
-            status = resp.status if resp else None
-            ct = None
-            try:
-                if resp:
-                    ct = (resp.headers or {}).get("content-type")
-            except Exception:
-                ct = None
-            return status, ct, html
-        finally:
-            await context.close()
+            # Persistent context preserves cookies across runs (helps NewsNow-style interstitials)
             await browser.close()
-
-
-# -----------------------------
-# Extraction pipeline (per URL)
-# -----------------------------
-
-async def extract_for_url(
-    initial_url: str,
-    title_hint: Optional[str],
-    settings: Settings,
-    desired_base_domain: Optional[str],
-) -> Dict[str, Any]:
-    """
-    Returns dict with keys:
-    status, error, fetch_url, canonical_url, http_status, content_type,
-    title, author, site_name, published_at, language, content_text, content_html
-    """
-    fetch_url = normalize_url(initial_url)
-
-    dbg: Dict[str, Any] = {"initial_url": initial_url, "steps": []}
-
-    # If URL is obviously a PDF, prefer searching for HTML if possible
-    if settings.prefer_html_over_pdf and title_hint and fetch_url.lower().split("?")[0].endswith(".pdf") and settings.search_fallback:
-        try:
-            dbg["steps"].append({"step": "search_for_html_instead_of_pdf"})
-            site = urlparse(fetch_url).netloc
-            q = f'{title_hint} -filetype:pdf'
-            cands = await ddg_search(q, settings, site=site or None)
-            alt = pick_search_candidate(cands, desired_base_domain or base_domain_from_netloc(site))
-            if alt:
-                fetch_url = alt
-                dbg["steps"].append({"step": "picked_alt_url", "alt": alt})
-        except Exception as e:
-            dbg["steps"].append({"step": "search_for_html_failed", "error": f"{type(e).__name__}: {e}"})
-
-    # Step 1: HTTP fetch
-    try:
-        await sleep_jitter(settings)
-        http_status, ct, body = await fetch_http(fetch_url, settings)
-        dbg["steps"].append({"step": "http_fetch", "status": http_status, "ct": ct, "bytes": len(body)})
-    except Exception as e:
-        return {
-            "status": "fetch_failed",
-            "error": f"http_error: {type(e).__name__}: {e}",
-            "fetch_url": fetch_url,
-            "canonical_url": None,
-            "http_status": None,
-            "content_type": None,
-            "title": None,
-            "author": None,
-            "site_name": None,
-            "published_at": None,
-            "language": None,
-            "content_text": None,
-            "content_html": None,
-            "debug": dbg,
-        }
-
-    # Step 2: PDF handling (optional)
-    if looks_like_pdf(fetch_url, ct):
-        if settings.enable_pdf:
+            context = await p.chromium.launch_persistent_context(
+                settings.playwright_profile_dir,
+                headless=settings.playwright_headless,
+                user_agent=settings.user_agent,
+                viewport={"width": 1280, "height": 800},
+            )
+            page = await context.new_page()
             try:
-                from pypdf import PdfReader  # type: ignore
-                import io
-                reader = PdfReader(io.BytesIO(body))
-                txt = "\n".join((p.extract_text() or "") for p in reader.pages).strip()
-                if txt:
-                    return {
-                        "status": "ok",
-                        "error": None,
-                        "fetch_url": fetch_url,
-                        "canonical_url": fetch_url,
-                        "http_status": http_status,
-                        "content_type": ct,
-                        "title": title_hint,
-                        "author": None,
-                        "site_name": None,
-                        "published_at": None,
-                        "language": None,
-                        "content_text": txt,
-                        "content_html": None,
-                        "debug": dbg,
-                    }
-                return {
-                    "status": "extract_failed",
-                    "error": "pdf_extract_empty",
-                    "fetch_url": fetch_url,
-                    "canonical_url": fetch_url,
-                    "http_status": http_status,
-                    "content_type": ct,
-                    "title": title_hint,
-                    "author": None,
-                    "site_name": None,
-                    "published_at": None,
-                    "language": None,
-                    "content_text": None,
-                    "content_html": None,
-                    "debug": dbg,
-                }
-            except Exception as e:
-                return {
-                    "status": "extract_failed",
-                    "error": f"pdf_extract_failed: {type(e).__name__}: {e}",
-                    "fetch_url": fetch_url,
-                    "canonical_url": fetch_url,
-                    "http_status": http_status,
-                    "content_type": ct,
-                    "title": title_hint,
-                    "author": None,
-                    "site_name": None,
-                    "published_at": None,
-                    "language": None,
-                    "content_text": None,
-                    "content_html": None,
-                    "debug": dbg,
-                }
-
-        return {
-            "status": "non_html",
-            "error": "pdf_detected",
-            "fetch_url": fetch_url,
-            "canonical_url": fetch_url,
-            "http_status": http_status,
-            "content_type": ct,
-            "title": title_hint,
-            "author": None,
-            "site_name": None,
-            "published_at": None,
-            "language": None,
-            "content_text": None,
-            "content_html": None,
-            "debug": dbg,
-        }
-
-    # decode HTML
-    try:
-        html = body.decode("utf-8", errors="replace")
-    except Exception:
-        html = str(body)
-
-    blocked = detect_blocked(http_status, html)
-    login_wall = detect_login_wall(html)
-
-    # Step 3: Playwright fallback if blocked or suspiciously empty
-    if settings.use_playwright_fallback and (blocked or len(html) < 2000):
-        try:
-            dbg["steps"].append({"step": "playwright_fallback_attempt"})
-            await sleep_jitter(settings)
-            pw_status, pw_ct, pw_html = await fetch_with_playwright(fetch_url, settings)
-            if pw_html and len(pw_html) > len(html):
-                html = pw_html
-                http_status = pw_status or http_status
-                ct = pw_ct or ct
-                blocked = detect_blocked(http_status, html)
-                login_wall = detect_login_wall(html)
-                dbg["steps"].append({"step": "playwright_fallback_used", "pw_status": pw_status, "pw_ct": pw_ct})
-        except Exception as e:
-            dbg["steps"].append({"step": "playwright_fallback_failed", "error": f"{type(e).__name__}: {e}"})
-
-    # Step 4: Search fallback if blocked / empty AND we have a title
-    if settings.search_fallback and title_hint and (blocked or len(html) < 2000):
-        try:
-            dbg["steps"].append({"step": "search_fallback_attempt"})
-            site = desired_base_domain or base_domain_from_netloc(urlparse(fetch_url).netloc)
-            q = f'{title_hint} -filetype:pdf'
-            cands = await ddg_search(q, settings, site=site)
-            alt = pick_search_candidate(cands, site)
-            if alt and alt != fetch_url:
-                dbg["steps"].append({"step": "search_fallback_picked", "alt": alt})
-                fetch_url = alt
-                await sleep_jitter(settings)
-                http_status, ct, body = await fetch_http(fetch_url, settings)
-                html = body.decode("utf-8", errors="replace")
-                blocked = detect_blocked(http_status, html)
-                login_wall = detect_login_wall(html)
-        except Exception as e:
-            dbg["steps"].append({"step": "search_fallback_failed", "error": f"{type(e).__name__}: {e}"})
-
-    # Don't bail out early on 'blocked' heuristics: attempt extraction first.
-    # We'll classify as blocked only if we *also* fail to get meaningful text.
-    suspected_blocked = blocked
-
-    # Step 5: Extract text
-    canonical = extract_canonical_url(html, fetch_url)
-    canonical_norm = normalize_url(canonical) if canonical else None
-
-    text, meta = extract_with_trafilatura(html, fetch_url)
-    if not text:
-        text = soup_fallback_extract(html)
-
-    # Step 6: If missing or too thin, try canonical / playwright / search
-    def _is_good(txt: str) -> bool:
-        return word_count(txt) >= settings.min_words
-
-    if canonical_norm and canonical_norm != fetch_url and (not text or not _is_good(text)):
-        try:
-            dbg["steps"].append({"step": "canonical_retry", "canonical": canonical_norm})
-            await sleep_jitter(settings)
-            http_status2, ct2, body2 = await fetch_http(canonical_norm, settings)
-            if ct2 and any(m in (ct2 or "").lower() for m in HTML_CT_MARKERS):
-                html2 = body2.decode("utf-8", errors="replace")
-                if not detect_blocked(http_status2, html2):
-                    t2, m2 = extract_with_trafilatura(html2, canonical_norm)
-                    if not t2:
-                        t2 = soup_fallback_extract(html2)
-                    if t2 and (not text or word_count(t2) > word_count(text)):
-                        text, meta = t2, (m2 or meta)
-                        fetch_url = canonical_norm
-                        http_status, ct, html = http_status2, ct2, html2
-        except Exception as e:
-            dbg["steps"].append({"step": "canonical_retry_failed", "error": f"{type(e).__name__}: {e}"})
-
-    if settings.use_playwright_fallback and (not text or not _is_good(text)):
-        try:
-            dbg["steps"].append({"step": "playwright_retry_for_thin"})
-            await sleep_jitter(settings)
-            pw_status, pw_ct, pw_html = await fetch_with_playwright(fetch_url, settings)
-            if pw_html and not detect_blocked(pw_status, pw_html):
-                t3, m3 = extract_with_trafilatura(pw_html, fetch_url)
-                if not t3:
-                    t3 = soup_fallback_extract(pw_html)
-                if t3 and (not text or word_count(t3) > word_count(text)):
-                    text, meta = t3, (m3 or meta)
-                    http_status = pw_status or http_status
-                    ct = pw_ct or ct
-        except Exception as e:
-            dbg["steps"].append({"step": "playwright_retry_failed", "error": f"{type(e).__name__}: {e}"})
-
-    if settings.search_fallback and title_hint and (not text or not _is_good(text)):
-        try:
-            dbg["steps"].append({"step": "search_retry_for_thin"})
-            site = desired_base_domain or base_domain_from_netloc(urlparse(fetch_url).netloc)
-            q = f'{title_hint} -filetype:pdf'
-            cands = await ddg_search(q, settings, site=site)
-            alt = pick_search_candidate(cands, site)
-            if alt and alt != fetch_url:
-                dbg["steps"].append({"step": "search_retry_picked", "alt": alt})
-                await sleep_jitter(settings)
-                http_status4, ct4, body4 = await fetch_http(alt, settings)
-                html4 = body4.decode("utf-8", errors="replace")
-                if not detect_blocked(http_status4, html4):
-                    t4, m4 = extract_with_trafilatura(html4, alt)
-                    if not t4:
-                        t4 = soup_fallback_extract(html4)
-                    if t4 and (not text or word_count(t4) > word_count(text)):
-                        text, meta = t4, (m4 or meta)
-                        fetch_url = alt
-                        http_status, ct = http_status4, ct4
-        except Exception as e:
-            dbg["steps"].append({"step": "search_retry_failed", "error": f"{type(e).__name__}: {e}"})
-
-    if not text:
-        return {
-            "status": ("login_wall" if login_wall else ("blocked" if suspected_blocked else "extract_failed")),
-            "error": ("login_wall_no_text" if login_wall else (f"blocked_or_waf_no_text (status={http_status})" if suspected_blocked else "no_text")),
-            "fetch_url": fetch_url,
-            "canonical_url": canonical_norm,
-            "http_status": http_status,
-            "content_type": ct,
-            "title": None,
-            "author": None,
-            "site_name": None,
-            "published_at": None,
-            "language": None,
-            "content_text": None,
-            "content_html": None,
-            "debug": dbg,
-        }
-
-    wc = word_count(text)
-    if wc < settings.min_words:
-        # Classify failures carefully:
-        # - login_wall if we saw paywall markers
-        # - blocked only if we saw strong WAF signals AND content is too thin
-        if login_wall:
-            st = "login_wall"
-            err = f"login_wall_thin_content (words={wc})"
-        elif suspected_blocked:
-            st = "blocked"
-            err = f"blocked_or_waf_thin_content (words={wc}, status={http_status})"
+                resp = await page.goto(url, wait_until="domcontentloaded", timeout=int(settings.timeout_s * 1000))
+                await page.wait_for_load_state("networkidle", timeout=int(settings.timeout_s * 1000))
+                html = await page.content()
+                ct = None
+                status = None
+                if resp is not None:
+                    status = resp.status
+                    ct = resp.headers.get("content-type")
+                final_url = page.url
+                return status, ct, html, final_url
+            finally:
+                await context.close()
         else:
-            st = "thin_content"
-            err = f"thin_content (words={wc})"
-        return {
-            "status": st,
-            "error": err,
-            "fetch_url": fetch_url,
-            "canonical_url": canonical_norm,
-            "http_status": http_status,
-            "content_type": ct,
-            "title": meta.get("title") or title_hint,
-            "author": meta.get("author"),
-            "site_name": meta.get("sitename"),
-            "published_at": meta.get("date"),
-            "language": meta.get("language"),
-            "content_text": text,
-            "content_html": None,
-            "debug": dbg,
-        }
+            context = await browser.new_context(user_agent=settings.user_agent)
+            page = await context.new_page()
+            try:
+                resp = await page.goto(url, wait_until="domcontentloaded", timeout=int(settings.timeout_s * 1000))
+                await page.wait_for_load_state("networkidle", timeout=int(settings.timeout_s * 1000))
+                html = await page.content()
+                ct = None
+                status = None
+                if resp is not None:
+                    status = resp.status
+                    ct = resp.headers.get("content-type")
+                final_url = page.url
+                return status, ct, html, final_url
+            finally:
+                await context.close()
+                await browser.close()
 
-    # Success
-    return {
-        "status": "ok",
-        "error": None,
-        "fetch_url": fetch_url,
-        "canonical_url": canonical_norm,
-        "http_status": http_status,
-        "content_type": ct,
-        "title": meta.get("title") or title_hint,
-        "author": meta.get("author"),
-        "site_name": meta.get("sitename"),
-        "published_at": meta.get("date"),
-        "language": meta.get("language"),
-        "content_text": text,
-        "content_html": None,
-        "debug": dbg,
-    }
+
+def pick_search_candidate(cands: Sequence[str], desired_base_domain: Optional[str]) -> Optional[str]:
+    for u in cands:
+        if not u or not u.startswith("http"):
+            continue
+        u2 = clean_url(u)
+        if is_bad_destination(u2):
+            continue
+        if desired_base_domain:
+            nl = urlparse(u2).netloc.lower()
+            if desired_base_domain not in nl:
+                continue
+        # reject obvious non-article endpoints
+        low = u2.lower()
+        if any(seg in low for seg in NON_ARTICLE_PATH_HINTS):
+            continue
+        return u2
+    return None
 
 
 # -----------------------------
-# DB wiring
+# Data structures
 # -----------------------------
+
+
+@dataclass
+class InputRow:
+    tracking_url: str
+    final_url: str
+    title: str
+    content_snip: str
+    attempts: int = 0
+
+
+@dataclass
+class PageResult:
+    key_url: str
+    fetched_url: str
+    canonical_url: Optional[str]
+    status: str
+    http_status: Optional[int]
+    content_type: Optional[str]
+    title: Optional[str]
+    author: Optional[str]
+    published_at: Optional[str]
+    sitename: Optional[str]
+    language: Optional[str]
+    content_text: Optional[str]
+    content_hash: Optional[str]
+    word_count: int
+    error: Optional[str]
+
+
+# -----------------------------
+# DB DDL + queries
+# -----------------------------
+
+
+DDL_ARTICLE_PAGES = """
+CREATE TABLE IF NOT EXISTS public.article_pages (
+  id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+  key_url text NOT NULL UNIQUE,
+  fetched_url text NULL,
+  canonical_url text NULL,
+  title text NULL,
+  author text NULL,
+  published_at timestamptz NULL,
+  sitename text NULL,
+  language text NULL,
+  content_text text NULL,
+  content_hash text NULL,
+  word_count int NULL,
+  status text NOT NULL DEFAULT 'new',
+  http_status int NULL,
+  content_type text NULL,
+  last_fetched_at timestamptz NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_article_pages_status ON public.article_pages(status);
+CREATE INDEX IF NOT EXISTS idx_article_pages_published_at ON public.article_pages(published_at);
+CREATE INDEX IF NOT EXISTS idx_article_pages_content_hash ON public.article_pages(content_hash);
+"""
+
+
+DDL_ARTICLE_PAGE_SOURCES = """
+CREATE TABLE IF NOT EXISTS public.article_page_sources (
+  tracking_url text PRIMARY KEY,
+  final_url text NULL,
+  key_url text NULL,
+  article_page_id uuid NULL REFERENCES public.article_pages(id) ON DELETE SET NULL,
+  status text NOT NULL,
+  http_status int NULL,
+  error text NULL,
+  attempts int NOT NULL DEFAULT 0,
+  last_attempt_at timestamptz NULL,
+  next_retry_at timestamptz NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_article_page_sources_status ON public.article_page_sources(status);
+CREATE INDEX IF NOT EXISTS idx_article_page_sources_next_retry ON public.article_page_sources(next_retry_at);
+"""
+
 
 SQL_FETCH_CANDIDATES = """
 SELECT
-  r.id AS raw_item_id,
-  r.url AS tracking_url,
-  r.title AS title,
-  r.content_snip AS content_snip,
-  ur.final_url AS resolved_url,
-  ae.status AS prev_status,
-  ae.attempts AS prev_attempts,
-  ae.next_retry_at AS prev_next_retry_at
+  ur.tracking_url,
+  ur.final_url,
+  COALESCE(r.title,'') AS title,
+  COALESCE(r.content_snip,'') AS content_snip,
+  COALESCE(aps.attempts, 0) AS attempts
 FROM public.url_resolutions ur
-JOIN public.raw_items r
+LEFT JOIN public.raw_items r
   ON r.url = ur.tracking_url
-LEFT JOIN public.article_extractions ae
-  ON ae.raw_item_id = r.id
+LEFT JOIN public.article_page_sources aps
+  ON aps.tracking_url = ur.tracking_url
 WHERE ur.status = 'ok'
   AND ur.final_url IS NOT NULL
-  AND (ae.raw_item_id IS NULL OR ae.status <> 'ok')
-  AND (ae.next_retry_at IS NULL OR ae.next_retry_at <= now())
-  AND (ae.attempts IS NULL OR ae.attempts < %s)
-ORDER BY r.fetched_at DESC
+  AND (
+    aps.tracking_url IS NULL
+    OR (
+      aps.status <> 'ok'
+      AND (aps.next_retry_at IS NULL OR aps.next_retry_at <= now())
+    )
+  )
+ORDER BY
+  CASE WHEN aps.tracking_url IS NULL THEN 0 ELSE 1 END,
+  ur.resolved_at DESC
 LIMIT %s;
 """
 
-SQL_UPSERT = """
-INSERT INTO public.article_extractions (
-  raw_item_id, original_url, resolved_url, fetch_url, canonical_url,
-  title, author, site_name, published_at, extracted_at,
-  http_status, content_type, language, word_count,
-  content_text, content_html, content_hash, raw_extraction_json,
-  status, error, attempts, next_retry_at
-) VALUES (
-  %(raw_item_id)s, %(original_url)s, %(resolved_url)s, %(fetch_url)s, %(canonical_url)s,
-  %(title)s, %(author)s, %(site_name)s, %(published_at)s, %(extracted_at)s,
-  %(http_status)s, %(content_type)s, %(language)s, %(word_count)s,
-  %(content_text)s, %(content_html)s, %(content_hash)s, %(raw_extraction_json)s,
-  %(status)s, %(error)s, %(attempts)s, %(next_retry_at)s
+
+SQL_UPSERT_PAGE = """
+INSERT INTO public.article_pages (
+  key_url, fetched_url, canonical_url, title, author, published_at,
+  sitename, language, content_text, content_hash, word_count,
+  status, http_status, content_type, last_fetched_at, updated_at
 )
-ON CONFLICT (raw_item_id) DO UPDATE SET
-  original_url = EXCLUDED.original_url,
-  resolved_url = EXCLUDED.resolved_url,
-  fetch_url = EXCLUDED.fetch_url,
-  canonical_url = COALESCE(EXCLUDED.canonical_url, public.article_extractions.canonical_url),
-  title = COALESCE(EXCLUDED.title, public.article_extractions.title),
-  author = COALESCE(EXCLUDED.author, public.article_extractions.author),
-  site_name = COALESCE(EXCLUDED.site_name, public.article_extractions.site_name),
-  published_at = COALESCE(EXCLUDED.published_at, public.article_extractions.published_at),
-  extracted_at = CASE
-    WHEN public.article_extractions.status = 'ok' AND EXCLUDED.status <> 'ok' THEN public.article_extractions.extracted_at
-    ELSE EXCLUDED.extracted_at
-  END,
-  http_status = CASE
-    WHEN public.article_extractions.status = 'ok' AND EXCLUDED.status <> 'ok' THEN public.article_extractions.http_status
-    ELSE EXCLUDED.http_status
-  END,
-  content_type = CASE
-    WHEN public.article_extractions.status = 'ok' AND EXCLUDED.status <> 'ok' THEN public.article_extractions.content_type
-    ELSE EXCLUDED.content_type
-  END,
-  language = COALESCE(EXCLUDED.language, public.article_extractions.language),
-  word_count = CASE
-    WHEN public.article_extractions.status = 'ok' AND EXCLUDED.status <> 'ok' THEN public.article_extractions.word_count
-    ELSE EXCLUDED.word_count
-  END,
-  content_text = CASE
-    WHEN public.article_extractions.status = 'ok' AND EXCLUDED.status <> 'ok' THEN public.article_extractions.content_text
-    ELSE EXCLUDED.content_text
-  END,
-  content_html = CASE
-    WHEN public.article_extractions.status = 'ok' AND EXCLUDED.status <> 'ok' THEN public.article_extractions.content_html
-    ELSE EXCLUDED.content_html
-  END,
-  content_hash = CASE
-    WHEN public.article_extractions.status = 'ok' AND EXCLUDED.status <> 'ok' THEN public.article_extractions.content_hash
-    ELSE EXCLUDED.content_hash
-  END,
-  raw_extraction_json = CASE
-    WHEN public.article_extractions.status = 'ok' AND EXCLUDED.status <> 'ok' THEN public.article_extractions.raw_extraction_json
-    ELSE EXCLUDED.raw_extraction_json
-  END,
+VALUES (
+  %s, %s, %s, %s, %s, %s,
+  %s, %s, %s, %s, %s,
+  %s, %s, %s, now(), now()
+)
+ON CONFLICT (key_url) DO UPDATE SET
+  -- Never downgrade a good page with a worse status
   status = CASE
-    WHEN public.article_extractions.status = 'ok' AND EXCLUDED.status <> 'ok' THEN public.article_extractions.status
+    WHEN public.article_pages.status = 'ok' AND EXCLUDED.status <> 'ok' THEN public.article_pages.status
     ELSE EXCLUDED.status
   END,
-  error = CASE
-    WHEN public.article_extractions.status = 'ok' AND EXCLUDED.status <> 'ok' THEN public.article_extractions.error
-    ELSE EXCLUDED.error
+  -- Preserve existing good content if new extraction is thin/empty
+  content_text = CASE
+    WHEN (EXCLUDED.status = 'ok' AND EXCLUDED.content_text IS NOT NULL AND length(EXCLUDED.content_text) > 0)
+      THEN EXCLUDED.content_text
+    ELSE public.article_pages.content_text
   END,
-  attempts = CASE
-    WHEN public.article_extractions.status = 'ok' AND EXCLUDED.status <> 'ok' THEN public.article_extractions.attempts
-    ELSE EXCLUDED.attempts
+  content_hash = COALESCE(EXCLUDED.content_hash, public.article_pages.content_hash),
+  word_count   = COALESCE(EXCLUDED.word_count, public.article_pages.word_count),
+  fetched_url  = COALESCE(EXCLUDED.fetched_url, public.article_pages.fetched_url),
+  canonical_url= COALESCE(EXCLUDED.canonical_url, public.article_pages.canonical_url),
+  title        = COALESCE(EXCLUDED.title, public.article_pages.title),
+  author       = COALESCE(EXCLUDED.author, public.article_pages.author),
+  published_at = COALESCE(EXCLUDED.published_at, public.article_pages.published_at),
+  sitename     = COALESCE(EXCLUDED.sitename, public.article_pages.sitename),
+  language     = COALESCE(EXCLUDED.language, public.article_pages.language),
+  http_status  = COALESCE(EXCLUDED.http_status, public.article_pages.http_status),
+  content_type = COALESCE(EXCLUDED.content_type, public.article_pages.content_type),
+  last_fetched_at = CASE
+    WHEN EXCLUDED.status = 'ok' THEN now()
+    ELSE public.article_pages.last_fetched_at
   END,
-  next_retry_at = CASE
-    WHEN public.article_extractions.status = 'ok' AND EXCLUDED.status <> 'ok' THEN public.article_extractions.next_retry_at
-    ELSE EXCLUDED.next_retry_at
-  END;
+  updated_at = now()
+RETURNING id;
 """
 
 
-def load_env(dotenv_path: Optional[str]) -> None:
-    if dotenv_path and load_dotenv:
+SQL_UPSERT_SOURCE = """
+INSERT INTO public.article_page_sources (
+  tracking_url, final_url, key_url, article_page_id,
+  status, http_status, error,
+  attempts, last_attempt_at, next_retry_at, updated_at
+)
+VALUES (
+  %s, %s, %s, %s,
+  %s, %s, %s,
+  1, now(), %s, now()
+)
+ON CONFLICT (tracking_url) DO UPDATE SET
+  final_url = EXCLUDED.final_url,
+  key_url = EXCLUDED.key_url,
+  article_page_id = COALESCE(EXCLUDED.article_page_id, public.article_page_sources.article_page_id),
+  status = EXCLUDED.status,
+  http_status = EXCLUDED.http_status,
+  error = EXCLUDED.error,
+  attempts = public.article_page_sources.attempts + 1,
+  last_attempt_at = now(),
+  next_retry_at = EXCLUDED.next_retry_at,
+  updated_at = now();
+"""
+
+
+# -----------------------------
+# Core resolve + extract
+# -----------------------------
+
+
+async def resolve_and_extract_one(key_url: str, title_hint: str, settings: Settings) -> PageResult:
+    """Fetch HTML and extract text for a single key_url."""
+
+    key_url = clean_url(key_url)
+    if is_bad_destination(key_url):
+        return PageResult(
+            key_url=key_url,
+            fetched_url=key_url,
+            canonical_url=None,
+            status="not_article",
+            http_status=None,
+            content_type=None,
+            title=None,
+            author=None,
+            published_at=None,
+            sitename=None,
+            language=None,
+            content_text=None,
+            content_hash=None,
+            word_count=0,
+            error="Bad destination URL",
+        )
+
+    # Primary: HTTP
+    http_status: Optional[int] = None
+    content_type: Optional[str] = None
+    fetched_url: str = key_url
+    html: Optional[str] = None
+    err: Optional[str] = None
+
+    try:
+        http_status, content_type, body, final_url = await fetch_http(key_url, settings)
+        fetched_url = clean_url(final_url or key_url)
+        # decode best-effort
+        html = body.decode("utf-8", errors="ignore")
+    except Exception as e:
+        err = f"HTTP fetch failed: {e}"
+
+    # If HTTP got blocked/login wall or failed, optionally try Playwright
+    blocked = False
+    login_wall = False
+    if html is not None:
+        blocked = detect_blocked(http_status, html)
+        login_wall = detect_login_wall(html)
+
+    if (err is not None or blocked or login_wall) and settings.use_playwright_fallback:
+        try:
+            pw_status, pw_ct, pw_html, pw_final = await fetch_with_playwright(key_url, settings)
+            http_status = pw_status
+            content_type = pw_ct
+            html = pw_html
+            fetched_url = clean_url(pw_final or key_url)
+            err = None
+            blocked = detect_blocked(http_status, html)
+            login_wall = detect_login_wall(html)
+        except Exception as e:
+            err = err or f"Playwright failed: {e}"
+
+    # If still blocked/login-wall and search fallback is enabled, try DDG
+    if settings.search_fallback and (blocked or login_wall or html is None):
+        # Use title hint if available; else last path segment
+        q = title_hint.strip() or urlparse(key_url).path.split("/")[-1]
+        desired = base_domain_from_netloc(urlparse(key_url).netloc)
+        try:
+            cands = await ddg_search(q, settings, site=desired)
+            cand = pick_search_candidate(cands, desired)
+            if cand and cand != key_url:
+                # fetch candidate
+                http_status, content_type, body, final_url = await fetch_http(cand, settings)
+                fetched_url = clean_url(final_url or cand)
+                html = body.decode("utf-8", errors="ignore")
+                blocked = detect_blocked(http_status, html)
+                login_wall = detect_login_wall(html)
+        except Exception as e:
+            err = err or f"Search fallback failed: {e}"
+
+    if html is None:
+        return PageResult(
+            key_url=key_url,
+            fetched_url=fetched_url,
+            canonical_url=None,
+            status="fetch_failed",
+            http_status=http_status,
+            content_type=content_type,
+            title=None,
+            author=None,
+            published_at=None,
+            sitename=None,
+            language=None,
+            content_text=None,
+            content_hash=None,
+            word_count=0,
+            error=err or "No HTML",
+        )
+
+    if blocked:
+        return PageResult(
+            key_url=key_url,
+            fetched_url=fetched_url,
+            canonical_url=None,
+            status="blocked",
+            http_status=http_status,
+            content_type=content_type,
+            title=None,
+            author=None,
+            published_at=None,
+            sitename=None,
+            language=None,
+            content_text=None,
+            content_hash=None,
+            word_count=0,
+            error="Blocked/WAF",
+        )
+
+    if login_wall:
+        return PageResult(
+            key_url=key_url,
+            fetched_url=fetched_url,
+            canonical_url=None,
+            status="login_wall",
+            http_status=http_status,
+            content_type=content_type,
+            title=None,
+            author=None,
+            published_at=None,
+            sitename=None,
+            language=None,
+            content_text=None,
+            content_hash=None,
+            word_count=0,
+            error="Login/subscribe wall",
+        )
+
+    # Extract canonical
+    canonical = extract_canonical_url(html)
+    canonical = clean_url(canonical) if canonical else None
+
+    # Extract content
+    text = ""
+    meta: Dict[str, Any] = {}
+    if trafilatura is not None:
+        try:
+            text, meta = extract_with_trafilatura(html, fetched_url)
+        except Exception:
+            text, meta = "", {}
+
+    if not text:
+        text = soup_fallback_extract(html)
+
+    text = (text or "").strip()
+    wc = word_count(text)
+
+    # Title: prefer meta title, else <title>
+    title_out = (meta.get("title") if meta else None) or None
+    if not title_out:
+        try:
+            soup = BeautifulSoup(html, "lxml")
+            title_tag = soup.find("title")
+            if title_tag:
+                title_out = (title_tag.get_text(strip=True) or None)
+        except Exception:
+            pass
+
+    # Reclassify obvious non-article pages
+    if looks_like_non_article(fetched_url, title_out or "", text):
+        return PageResult(
+            key_url=key_url,
+            fetched_url=fetched_url,
+            canonical_url=canonical,
+            status="not_article",
+            http_status=http_status,
+            content_type=content_type,
+            title=title_out,
+            author=(meta.get("author") if meta else None),
+            published_at=(meta.get("date") if meta else None),
+            sitename=(meta.get("sitename") if meta else None),
+            language=(meta.get("language") if meta else None),
+            content_text=None,
+            content_hash=None,
+            word_count=wc,
+            error="Non-article page",
+        )
+
+    if wc < settings.min_words:
+        return PageResult(
+            key_url=key_url,
+            fetched_url=fetched_url,
+            canonical_url=canonical,
+            status="thin_content",
+            http_status=http_status,
+            content_type=content_type,
+            title=title_out,
+            author=(meta.get("author") if meta else None),
+            published_at=(meta.get("date") if meta else None),
+            sitename=(meta.get("sitename") if meta else None),
+            language=(meta.get("language") if meta else None),
+            content_text=text,
+            content_hash=to_hash(text),
+            word_count=wc,
+            error=f"Below min_words ({wc}<{settings.min_words})",
+        )
+
+    return PageResult(
+        key_url=key_url,
+        fetched_url=fetched_url,
+        canonical_url=canonical,
+        status="ok",
+        http_status=http_status,
+        content_type=content_type,
+        title=title_out,
+        author=(meta.get("author") if meta else None),
+        published_at=(meta.get("date") if meta else None),
+        sitename=(meta.get("sitename") if meta else None),
+        language=(meta.get("language") if meta else None),
+        content_text=text,
+        content_hash=to_hash(text),
+        word_count=wc,
+        error=None,
+    )
+
+
+async def resolve_many(unique_urls: List[Tuple[str, str]], settings: Settings, concurrency: int) -> Dict[str, PageResult]:
+    """unique_urls: list of (key_url, title_hint). Returns mapping key_url->PageResult"""
+    sem = asyncio.Semaphore(max(1, concurrency))
+    results: Dict[str, PageResult] = {}
+
+    async def _run_one(u: str, t: str):
+        async with sem:
+            res = await resolve_and_extract_one(u, t, settings)
+            results[u] = res
+            if settings.delay_max > 0:
+                await asyncio.sleep(random.uniform(max(0.0, settings.delay_min), max(settings.delay_min, settings.delay_max)))
+
+    tasks = [asyncio.create_task(_run_one(u, t)) for u, t in unique_urls]
+    await asyncio.gather(*tasks)
+    return results
+
+
+# -----------------------------
+# DB helpers
+# -----------------------------
+
+
+def _load_env(dotenv_path: Optional[str]) -> None:
+    if dotenv_path and load_dotenv is not None:
         load_dotenv(dotenv_path, override=False)
 
 
-def get_dsn_from_env() -> str:
-    """
-    Preference order:
-    1) DATABASE_URL if present and looks real
-    2) DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD
-    """
-    db_url = os.getenv("DATABASE_URL")
-    if db_url and not any(x in db_url for x in ["USER:PASS@HOST", "<DB_USER>", "<DB_PASSWORD>", "@HOST:"]):
-        return db_url
-
-    host = os.getenv("DB_HOST", "localhost")
-    port = os.getenv("DB_PORT", "5432")
-    name = os.getenv("DB_NAME", "inip")
+def _build_dsn(dotenv_path: Optional[str]) -> str:
+    _load_env(dotenv_path)
+    # Prefer explicit DB_* settings
+    host = os.getenv("DB_HOST")
+    port = os.getenv("DB_PORT")
+    name = os.getenv("DB_NAME")
     user = os.getenv("DB_USER")
-    pw = os.getenv("DB_PASSWORD")
-    if not user or not pw:
-        raise RuntimeError("Missing DB_USER/DB_PASSWORD in env (or set a valid DATABASE_URL).")
-    return f"dbname={name} user={user} password={pw} host={host} port={port}"
+    password = os.getenv("DB_PASSWORD")
+
+    if host and name and user:
+        port = port or "5432"
+        # psycopg2 supports both DSN string and kwargs; use DSN string
+        parts = [f"host={host}", f"port={port}", f"dbname={name}", f"user={user}"]
+        if password:
+            parts.append(f"password={password}")
+        return " ".join(parts)
+
+    # Fallback to DATABASE_URL if it looks real (avoid placeholders)
+    dburl = os.getenv("DATABASE_URL")
+    if dburl and all(x not in dburl for x in ["USER:PASS", "@HOST", "/DB"]):
+        return dburl
+
+    raise RuntimeError("DB connection not configured. Set DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD in .env")
+
+
+def _connect_pg(dotenv_path: Optional[str]):
+    dsn = _build_dsn(dotenv_path)
+    return psycopg2.connect(dsn)
+
+
+def ensure_tables(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute("CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";")
+        cur.execute(DDL_ARTICLE_PAGES)
+        cur.execute(DDL_ARTICLE_PAGE_SOURCES)
+    conn.commit()
 
 
 # -----------------------------
-# Run modes
+# Modes
 # -----------------------------
 
-async def run_db_mode_async(args: argparse.Namespace) -> int:
-    if psycopg2 is None:
-        raise SystemExit("Missing dependency 'psycopg2-binary'. Install with: python -m pip install psycopg2-binary")
 
+def run_db_mode(args) -> int:
     settings = Settings(
         timeout_s=args.timeout,
         proxy=args.proxy,
-        user_agent=args.user_agent,
         delay_min=args.delay_min,
         delay_max=args.delay_max,
         use_playwright_fallback=args.use_playwright_fallback,
@@ -1016,211 +1083,201 @@ async def run_db_mode_async(args: argparse.Namespace) -> int:
         playwright_headless=not args.playwright_headful,
         search_fallback=args.search_fallback,
         min_words=args.min_words,
-        prefer_html_over_pdf=not args.no_prefer_html_over_pdf,
-        enable_pdf=args.enable_pdf,
-        cache_by_url=not args.no_cache_by_url,
         max_attempts=args.max_attempts,
-        retry_base_minutes=args.retry_base_minutes,
-        retry_max_hours=args.retry_max_hours,
     )
 
-    load_env(args.dotenv_path)
-    dsn = get_dsn_from_env()
+    # Safety: shared Playwright profile + concurrency>1 is trouble
+    if settings.use_playwright_fallback and settings.playwright_profile_dir and args.concurrency > 1:
+        print("[warn] Playwright persistent profile dir + concurrency>1 can lock the profile. Forcing concurrency=1.")
+        args.concurrency = 1
 
-    conn = psycopg2.connect(dsn)
-    conn.autocommit = False
+    conn = _connect_pg(args.dotenv_path)
+    ensure_tables(conn)
 
-    try:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(SQL_FETCH_CANDIDATES, (settings.max_attempts, args.limit))
-            rows = cur.fetchall()
+    # Fetch candidate tracking URLs
+    with conn.cursor() as cur:
+        cur.execute(SQL_FETCH_CANDIDATES, (args.limit,))
+        rows = cur.fetchall()
 
-        if not rows:
-            print("No candidates found.")
-            return 0
+    inputs: List[InputRow] = []
+    for tracking_url, final_url, title, content_snip, attempts in rows:
+        inputs.append(InputRow(
+            tracking_url=tracking_url,
+            final_url=final_url,
+            title=title or "",
+            content_snip=content_snip or "",
+            attempts=int(attempts or 0),
+        ))
 
-        # Build candidate objects and optionally cache by URL
-        candidates: List[Dict[str, Any]] = []
-        for r in rows:
-            candidates.append({
-                "raw_item_id": str(r["raw_item_id"]),
-                "tracking_url": r["tracking_url"],
-                "resolved_url": r["resolved_url"],
-                "title": r.get("title"),
-                "content_snip": r.get("content_snip"),
-                "prev_attempts": int(r["prev_attempts"]) if r.get("prev_attempts") is not None else 0,
-            })
-
-        # group by fetch_url for caching
-        groups: Dict[str, List[Dict[str, Any]]] = {}
-        for c in candidates:
-            fetch_url = normalize_url(c["resolved_url"] or c["tracking_url"])
-            c["fetch_url0"] = fetch_url
-            groups.setdefault(fetch_url, []).append(c)
-
-        sem = asyncio.Semaphore(max(1, args.concurrency))
-        cache: Dict[str, Dict[str, Any]] = {}
-        db_lock = asyncio.Lock()
-
-        async def _run_group(fetch_url: str, group: List[Dict[str, Any]]) -> None:
-            # pick the best title hint among group
-            title_hint = None
-            for g in group:
-                if g.get("title"):
-                    title_hint = g["title"]
-                    break
-            # desired domain for search restrictions
-            desired = None
-            try:
-                desired = base_domain_from_netloc(urlparse(fetch_url).netloc)
-            except Exception:
-                desired = None
-
-            async with sem:
-                if settings.cache_by_url and fetch_url in cache:
-                    result = cache[fetch_url]
-                else:
-                    result = await extract_for_url(fetch_url, title_hint, settings, desired)
-                    if settings.cache_by_url:
-                        cache[fetch_url] = result
-
-            # write per raw_item_id
-            async with db_lock:
-                with conn.cursor() as wcur:
-                    for g in group:
-                        attempts_total = int(g.get("prev_attempts") or 0) + 1
-                        status = result["status"]
-                        error = result.get("error")
-                        next_retry = compute_next_retry(status, attempts_total, settings)
-
-                        row = {
-                            "raw_item_id": g["raw_item_id"],
-                            "original_url": g["tracking_url"],
-                            "resolved_url": g["resolved_url"],
-                            "fetch_url": (result.get("fetch_url") or fetch_url),
-                            "canonical_url": result.get("canonical_url"),
-                            "title": result.get("title") or title_hint,
-                            "author": result.get("author"),
-                            "site_name": result.get("site_name"),
-                            "published_at": result.get("published_at"),
-                            "extracted_at": datetime.now(timezone.utc),
-                            "http_status": result.get("http_status"),
-                            "content_type": result.get("content_type"),
-                            "language": result.get("language"),
-                            "word_count": word_count(result.get("content_text") or "") if result.get("content_text") else None,
-                            "content_text": result.get("content_text"),
-                            "content_html": result.get("content_html"),
-                            "content_hash": to_hash(result.get("content_text") or "") if result.get("content_text") else None,
-                            "raw_extraction_json": json.dumps({"status": status, "error": error, "used_url": (result.get("fetch_url") or fetch_url), "debug": result.get("debug")}, ensure_ascii=False),
-                            "status": status,
-                            "error": error,
-                            "attempts": attempts_total,
-                            "next_retry_at": next_retry,
-                        }
-                        wcur.execute(SQL_UPSERT, row)
-                conn.commit()
-
-        tasks = []
-        for fu, grp in groups.items():
-            tasks.append(asyncio.create_task(_run_group(fu, grp)))
-        await asyncio.gather(*tasks)
-        print(f"DB run complete. Candidates: {len(candidates)} | Unique URLs: {len(groups)}")
+    if not inputs:
+        print("No candidates to fetch.")
         return 0
-    finally:
-        conn.close()
+
+    # Build unique key_url list
+    key_to_title: Dict[str, str] = {}
+    tracking_to_key: Dict[str, str] = {}
+    for it in inputs:
+        key = clean_url(it.final_url)
+        tracking_to_key[it.tracking_url] = key
+        if key not in key_to_title:
+            key_to_title[key] = it.title
+
+    unique_list = [(k, key_to_title.get(k, "")) for k in key_to_title.keys()]
+
+    # Resolve/extract
+    results = asyncio.run(resolve_many(unique_list, settings, args.concurrency))
+
+    ok_sources = 0
+    attempted_sources = 0
+
+    # Upsert pages, then sources
+    with conn.cursor() as cur:
+        # Cache page_id by key_url for this run
+        page_ids: Dict[str, str] = {}
+
+        for key_url, res in results.items():
+            # Store/Upsert page
+            # published_at: parse best-effort if ISO; else NULL
+            pub = None
+            if res.published_at:
+                try:
+                    # psycopg2 can parse ISO timestamps if passed as string with tz; otherwise just keep None
+                    pub = res.published_at
+                except Exception:
+                    pub = None
+
+            cur.execute(
+                SQL_UPSERT_PAGE,
+                (
+                    res.key_url,
+                    res.fetched_url,
+                    res.canonical_url,
+                    res.title,
+                    res.author,
+                    pub,
+                    res.sitename,
+                    res.language,
+                    res.content_text,
+                    res.content_hash,
+                    res.word_count,
+                    res.status,
+                    res.http_status,
+                    res.content_type,
+                ),
+            )
+            page_id = cur.fetchone()[0]
+            page_ids[key_url] = str(page_id)
+
+        # Now upsert each tracking_url mapping
+        for it in inputs:
+            attempted_sources += 1
+            key = tracking_to_key[it.tracking_url]
+            res = results.get(key)
+            if res is None:
+                continue
+
+            attempts_total = it.attempts + 1
+            next_retry = compute_next_retry(res.status, attempts_total, settings)
+            next_retry_val = next_retry.isoformat() if next_retry else None
+
+            cur.execute(
+                SQL_UPSERT_SOURCE,
+                (
+                    it.tracking_url,
+                    it.final_url,
+                    key,
+                    page_ids.get(key),
+                    res.status,
+                    res.http_status,
+                    res.error,
+                    next_retry_val,
+                ),
+            )
+            if res.status == "ok":
+                ok_sources += 1
+
+    conn.commit()
+    conn.close()
+
+    print(f"DB run complete. Attempted inputs: {attempted_sources} | OK mappings: {ok_sources} | Unique URLs fetched: {len(results)}")
+    return 0
 
 
-def run_db_mode(args: argparse.Namespace) -> int:
-    return asyncio.run(run_db_mode_async(args))
-
-
-def run_csv_mode(args: argparse.Namespace) -> int:
+def run_csv_mode(args) -> int:
     if pd is None:
-        raise SystemExit("Missing dependency 'pandas'. Install with: python -m pip install pandas")
-    df = pd.read_csv(args.csv, encoding=args.csv_encoding)
+        raise SystemExit("CSV mode requires pandas. Install with: python -m pip install pandas")
 
-    # Determine which column contains the URL we should fetch
+    settings = Settings(
+        timeout_s=args.timeout,
+        proxy=args.proxy,
+        delay_min=args.delay_min,
+        delay_max=args.delay_max,
+        use_playwright_fallback=args.use_playwright_fallback,
+        playwright_profile_dir=args.playwright_profile_dir,
+        playwright_headless=not args.playwright_headful,
+        search_fallback=args.search_fallback,
+        min_words=args.min_words,
+        max_attempts=args.max_attempts,
+    )
+
+    df = pd.read_csv(args.csv, encoding=args.csv_encoding)
+    # infer columns
     url_col = None
-    for c in ["final_url", "fetch_url", "resolved_url", "url"]:
+    for c in ["final_url", "resolved_url", "fetch_url", "url"]:
         if c in df.columns:
             url_col = c
             break
     if not url_col:
-        raise SystemExit("CSV mode requires one of columns: final_url, fetch_url, resolved_url, url")
+        raise SystemExit("CSV must contain one of: final_url, resolved_url, fetch_url, url")
 
+    tracking_col = "tracking_url" if "tracking_url" in df.columns else None
     title_col = "title" if "title" in df.columns else None
-    # Filter out empty URLs
-    df = df[df[url_col].notna()].copy()
-    if args.limit:
-        df = df.head(args.limit)
 
-    settings = Settings(
-        timeout_s=args.timeout,
-        proxy=args.proxy,
-        user_agent=args.user_agent,
-        delay_min=args.delay_min,
-        delay_max=args.delay_max,
-        use_playwright_fallback=args.use_playwright_fallback,
-        playwright_profile_dir=args.playwright_profile_dir,
-        playwright_headless=not args.playwright_headful,
-        search_fallback=args.search_fallback,
-        min_words=args.min_words,
-        prefer_html_over_pdf=not args.no_prefer_html_over_pdf,
-        enable_pdf=args.enable_pdf,
-        cache_by_url=not args.no_cache_by_url,
-        max_attempts=args.max_attempts,
-        retry_base_minutes=args.retry_base_minutes,
-        retry_max_hours=args.retry_max_hours,
-    )
+    rows: List[InputRow] = []
+    for _, r in df.iterrows():
+        final_url = str(r.get(url_col) or "").strip()
+        if not final_url or not final_url.startswith("http"):
+            continue
+        tracking_url = str(r.get(tracking_col) or final_url).strip() if tracking_col else final_url
+        title = str(r.get(title_col) or "").strip() if title_col else ""
+        rows.append(InputRow(tracking_url=tracking_url, final_url=final_url, title=title, content_snip="", attempts=0))
 
-    async def _run() -> pd.DataFrame:
-        sem = asyncio.Semaphore(max(1, args.concurrency))
-        cache: Dict[str, Dict[str, Any]] = {}
-        db_lock = asyncio.Lock()
-        out_rows: List[Dict[str, Any]] = []
+    # De-dupe by key_url
+    key_to_title: Dict[str, str] = {}
+    tracking_to_key: Dict[str, str] = {}
+    for it in rows:
+        key = clean_url(it.final_url)
+        tracking_to_key[it.tracking_url] = key
+        if key not in key_to_title:
+            key_to_title[key] = it.title
 
-        async def _one(u: str, title: Optional[str]) -> None:
-            fu = normalize_url(u)
-            desired = None
-            try:
-                desired = base_domain_from_netloc(urlparse(fu).netloc)
-            except Exception:
-                desired = None
-            async with sem:
-                if settings.cache_by_url and fu in cache:
-                    res = cache[fu]
-                else:
-                    res = await extract_for_url(fu, title, settings, desired)
-                    if settings.cache_by_url:
-                        cache[fu] = res
-            txt = res.get("content_text") or ""
-            out_rows.append({
-                "input_url": u,
-                "fetch_url": res.get("fetch_url") or fu,
-                "canonical_url": res.get("canonical_url"),
-                "status": res.get("status"),
-                "error": res.get("error"),
-                "http_status": res.get("http_status"),
-                "content_type": res.get("content_type"),
-                "title": res.get("title") or title,
-                "word_count": word_count(txt) if txt else None,
-                "content_text": txt if txt else None,
-                "content_hash": to_hash(txt) if txt else None,
-                "raw_extraction_json": json.dumps({"debug": res.get("debug")}, ensure_ascii=False),
-            })
+    unique_list = [(k, key_to_title.get(k, "")) for k in key_to_title.keys()]
+    results = asyncio.run(resolve_many(unique_list, settings, args.concurrency))
 
-        tasks = []
-        for _, r in df.iterrows():
-            u = str(r[url_col])
-            title = str(r[title_col]) if title_col and pd.notna(r[title_col]) else None
-            tasks.append(asyncio.create_task(_one(u, title)))
-        await asyncio.gather(*tasks)
+    out_rows: List[Dict[str, Any]] = []
+    for it in rows:
+        key = tracking_to_key[it.tracking_url]
+        res = results.get(key)
+        if not res:
+            continue
+        out_rows.append({
+            "tracking_url": it.tracking_url,
+            "final_url": it.final_url,
+            "clean_url": key,
+            "fetched_url": res.fetched_url,
+            "canonical_url": res.canonical_url,
+            "resolve_status": res.status,
+            "http_status": res.http_status,
+            "content_type": res.content_type,
+            "title_extracted": res.title,
+            "word_count": res.word_count,
+            "content_hash": res.content_hash,
+            "error": res.error,
+        })
 
-        return pd.DataFrame(out_rows)
-
-    out_df = asyncio.run(_run())
-    out_df.to_csv(args.out, index=False, encoding="utf-8")
-    print(f"Wrote {args.out}. Attempted: {len(out_df)} | OK: {(out_df['status']=='ok').sum()}")
+    out_df = pd.DataFrame(out_rows)
+    out_df.to_csv(args.out, index=False)
+    print(f"Wrote {args.out}. Inputs: {len(rows)} | Unique fetched: {len(results)} | OK: {sum(1 for r in results.values() if r.status=='ok')}")
     return 0
 
 
@@ -1228,49 +1285,39 @@ def run_csv_mode(args: argparse.Namespace) -> int:
 # CLI
 # -----------------------------
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Fetch and extract article content into article_extractions (v8).")
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Fetch & extract article content (Option B: unique clean_url + mapping table)")
     mode = p.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--db", action="store_true", help="Run in DB mode using url_resolutions + raw_items.")
-    mode.add_argument("--csv", type=str, help="Run in CSV mode reading resolved URLs.")
-    p.add_argument("--out", type=str, default="article_extractions_out.csv", help="CSV output in --csv mode.")
-    p.add_argument("--csv-encoding", type=str, default="utf-8", help="CSV input encoding.")
-    p.add_argument("--limit", type=int, default=150, help="Limit rows processed.")
-    p.add_argument("--concurrency", type=int, default=1, help="Concurrency (keep low).")
+    mode.add_argument("--db", action="store_true", help="Run against Postgres (url_resolutions -> article_pages + mapping)")
+    mode.add_argument("--csv", type=str, help="Input CSV path")
 
-    # HTTP
-    p.add_argument("--timeout", type=float, default=25.0, help="HTTP timeout (seconds).")
-    p.add_argument("--proxy", type=str, default=None, help="Proxy URL (optional).")
-    p.add_argument("--user-agent", type=str, default=Settings.user_agent, help="User-Agent string.")
+    p.add_argument("--out", type=str, default="article_extractions.csv", help="CSV output path (CSV mode)")
+    p.add_argument("--csv-encoding", type=str, default="utf-8", help="CSV encoding (CSV mode)")
 
-    # pacing
-    p.add_argument("--delay-min", type=float, default=0.0, help="Min delay between requests (seconds).")
-    p.add_argument("--delay-max", type=float, default=0.0, help="Max delay between requests (seconds).")
+    p.add_argument("--dotenv-path", type=str, default=None, help="Path to .env (DB mode)")
+    p.add_argument("--limit", type=int, default=200, help="Max candidates (DB mode)")
 
-    # fallbacks
-    p.add_argument("--use-playwright-fallback", action="store_true", help="Use Playwright when blocked/thin.")
-    p.add_argument("--playwright-headful", action="store_true", help="Run Playwright headful (debug).")
-    p.add_argument("--playwright-profile-dir", type=str, default=None, help="Kept for compatibility (future use).")
-    p.add_argument("--search-fallback", action="store_true", help="Use DuckDuckGo HTML search when blocked/thin.")
+    p.add_argument("--concurrency", type=int, default=1)
+    p.add_argument("--timeout", type=float, default=25.0)
+    p.add_argument("--proxy", type=str, default=None)
 
-    # extraction tuning
-    p.add_argument("--min-words", type=int, default=120, help="Minimum words required to treat extraction as OK.")
-    p.add_argument("--no-prefer-html-over-pdf", action="store_true", help="If set, do not try to find HTML alternatives for PDFs.")
-    p.add_argument("--enable-pdf", action="store_true", help="If set, try extracting PDFs (requires pypdf).")
+    p.add_argument("--delay-min", type=float, default=0.0)
+    p.add_argument("--delay-max", type=float, default=0.0)
 
-    # reliability / retry
-    p.add_argument("--max-attempts", type=int, default=5, help="Stop retrying after this many attempts per raw_item_id.")
-    p.add_argument("--retry-base-minutes", type=int, default=60, help="Base retry delay (minutes). Exponential backoff applied.")
-    p.add_argument("--retry-max-hours", type=int, default=48, help="Max retry delay (hours).")
-    p.add_argument("--no-cache-by-url", action="store_true", help="Disable within-run caching by fetch_url (slower).")
+    p.add_argument("--use-playwright-fallback", action="store_true")
+    p.add_argument("--playwright-profile-dir", type=str, default=None)
+    p.add_argument("--playwright-headful", action="store_true", help="Run Playwright headful (debug)")
 
-    # env
-    p.add_argument("--dotenv-path", type=str, default=None, help="Path to .env file.")
+    p.add_argument("--search-fallback", action="store_true")
+
+    p.add_argument("--min-words", type=int, default=140)
+    p.add_argument("--max-attempts", type=int, default=5)
     return p
 
 
 def main(argv: Sequence[str]) -> int:
-    args = build_parser().parse_args(argv)
+    args = build_arg_parser().parse_args(list(argv))
     if args.db:
         return run_db_mode(args)
     return run_csv_mode(args)

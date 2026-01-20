@@ -1,0 +1,84 @@
+Entity Name,Category,Market Rank / Focus,Validated Target URL,Ingestion Tech,Signal Value,Selector
+Aviva UK,Insurer,1 (Leader),https://www.aviva.com/search/#sort=date%20descending&displaytag=motor-home-and-travel-news%2Cfinancial-news%2Cwealth-and-retirement-news%2Chealth-and-protection-news%2Clatest-announcement%2Csustainability-news%2Cmedia-statement%2Csponsorship-news%2Cour-workplace-news%2Cleadership-news%2Cfeatures,Dynamic JS,Critical - Market Mover,a.search-result-item__link
+RSA Insurance (Intact),Insurer,2 (Leader),https://www.intactinsurance.co.uk/news/press-releases,Dynamic JS,Critical - Tech & Underwriting,"a[href*=""/news/press-releases/""]"
+AXA UK,Insurer,3 (Leader),https://www.axa.co.uk/newsroom/,Dynamic JS,Critical - Consumer Trends,a.news-card__link
+Zurich UK,Insurer,4 (Leader),https://www.zurich.co.uk/search-results?sorting=d_desc,Dynamic JS,Critical - Risk Insights,a.card-link
+Allianz UK,Insurer,5 (Leader),https://www.mynewsdesk.com/uk/allianz-insurance/pressreleases,Dynamic JS,Critical - Commercial & Claims,a.news-item-link
+AIG UK,Insurer,6 (Global),https://www.aig.co.uk/home/insight-page?criteria=topic:latest-articles,Dynamic JS,High - Liability & Global Risk,article a
+Bupa UK,Insurer,7 (Health),https://www.bupa.com/news-and-press/press-releases,Dynamic JS,High - Health Trends,a.listing-item__link
+Direct Line Group,Insurer,8 (Personal),https://www.directlinegroup.co.uk/en/news/brand-news.html,Dynamic JS,High - Motor Repair Inflation,p.article-list-item-title a
+Admiral Group,Insurer,9 (Personal),https://admiralgroup.co.uk/news-releases,Dynamic JS,High - Pricing Discipline,a.views-row-link
+NFU Mutual,Insurer,10 (Rural),https://www.nfumutual.co.uk/media-centre/,Dynamic JS,High - Rural Crime & Weather,h3.card__title a
+QBE Europe,Insurer,Top 20 (Comm),https://qbeeurope.com/news-and-events/press-releases/,Dynamic JS,High - Liability & Fleet,h3.card-title a
+Covea Insurance,Insurer,Top 20 (Comm),https://www.coveainsurance.co.uk/news-hub/press-releases/,Dynamic JS,Medium - Commercial Lines,h3.news-card__title a
+Hiscox UK,Insurer,Top 20 (HNW),https://www.hiscoxgroup.com/news/press-releases,Dynamic JS,High - Cyber & Art,h3 a
+Ageas UK,Insurer,Top 20 (Personal),https://www.ageas.co.uk/newsroom/,Dynamic JS,Medium - Broker Sentiment,a.card__link
+Hastings Group,Insurer,Top 20 (Personal),https://www.hastingsplc.com/news-announcements,Dynamic JS,Medium - Trading Updates,a.news-item__link
+Chubb UK,Insurer,Top 20 (Global),https://news.chubb.com/news-releases?videoid=&c=t,Dynamic JS,High - Major Loss Events,a.item-link
+LV= General Insurance,Insurer,Top 20 (Personal),https://www.lv.com/about-us/press/press-releases,Dynamic JS,Medium - Electric Cars,a.search-result__link
+Esure Group,Insurer,Top 20 (Personal),https://www.esuregroup.com/news,Dynamic JS,Low - Corporate News,h3 a
+Beazley,Insurer,Top 50 (Specialty),https://www.beazley.com/en-gb/news-and-events,Dynamic JS,Critical - Cyber Pricing,a.card-link
+Markel UK,Insurer,Top 50 (SME),https://www.markel.com/about-us/news-and-press,Dynamic JS,High - Care & Tech PI,a.mkl-card__link
+Ecclesiastical,Insurer,Top 50 (Niche),https://www.ecclesiastical.com/media-centre/news-and-pr/,Dynamic JS,High - Heritage & Charity,a.card__link
+Travelers Europe,Insurer,Top 50 (SME),https://www.travelers.co.uk/insights,Dynamic JS,Medium - Tech Risks,a.card-link
+Tokio Marine Kiln,Insurer,Top 50 (London),https://www.tokiomarinekiln.com/news-and-views/,Dynamic JS,High - London Market,a.card-link
+Vitality,Insurer,Top 50 (Health),https://www.vitality.co.uk/media/,Dynamic JS,High - Wellness Data,a.card-link
+Sabre Insurance,Insurer,Top 50 (Motor),https://sabre.co.uk/broker/news-update/,Dynamic JS,High - Granular Pricing,h2.entry-title a
+Chaucer Group,Insurer,Top 50 (Specialty),https://www.chaucergroup.com/news/,Dynamic JS,High - Political Risk,a.news-card-link
+Aspen Insurance UK,Insurer,Top 50 (Reins),https://www.aspen.co/news/,Dynamic JS,Medium - Reinsurance,a.news-item-link
+Convex Insurance,Insurer,Top 50 (Scale-up),https://convexin.com/news-views/,Dynamic JS,High - Emerging Risks,h3.post-title a
+Fidelis Insurance,Insurer,Top 50 (Specialty),https://www.fidelisinsurance.com/news-and-media/,Dynamic JS,Medium - Specialty,a.news-link
+Lancashire Holdings,Insurer,Top 50 (Specialty),https://www.lancashiregroup.com/en/news-and-insights.html,Dynamic JS,High - Energy & Marine,a.card-link
+Brit Insurance,Insurer,Top 50 (London),https://www.britinsurance.com/news,Dynamic JS,High - Algorithm Innovation,a.card-link
+Liberty Specialty,Insurer,Top 50 (Comm),https://www.libertyspecialtymarkets.com/gb-en/newsroom,Dynamic JS,High - Commercial,a.card-link
+Arch Insurance Int,Insurer,Top 50 (Comm),https://www.archgroup.com/news/?region=International,Dynamic JS,Medium - Regional Brokers,a.news-link
+MS Amlin,Insurer,Top 50 (Reins),https://www.msamlin.com/en/news-and-insights.html,Dynamic JS,High - Reinsurance Rates,a.card-link
+Legal & General,Insurer,Top 50 (Life),https://group.legalandgeneral.com/en/newsroom/press-releases,Dynamic JS,High - Property Investment,a.search-result__link
+Royal London,Insurer,Top 50 (Life),https://www.royallondon.com/about-us/media/media-centre/press-releases/,Dynamic JS,Medium - Pensions,a.search-result__link
+Phoenix Group,Insurer,Top 50 (Life),https://www.thephoenixgroup.com/news-and-insights/,Dynamic JS,Low - M&A,a.card-link
+Just Group,Insurer,Top 50 (Life),https://www.justgroupplc.co.uk/news-and-media,Dynamic JS,Medium - Care Funding,a.news-item-link
+Canada Life UK,Insurer,Top 50 (Life),https://www.canadalife.co.uk/news/,Dynamic JS,Low - Wealth,a.card-link
+Unum UK,Insurer,Top 50 (Emp Ben),https://www.unum.co.uk/news,Dynamic JS,Medium - Return to Work,a.card-link
+Simplyhealth,Insurer,Top 50 (Health),https://www.simplyhealth.co.uk/about-us/media-centre,Dynamic JS,Low - Dental/Cash Plan,a.card-link
+WPA,Insurer,Top 50 (Health),https://www.wpa.org.uk/about-us/news,Dynamic JS,Medium - Health Trends,a.news-link
+HDI Global UK,Insurer,Top 50 (Ind),https://www.hdi.global/infocenter/press/,Dynamic JS,High - Industrial Risk,a.news-link
+Generali UK,Insurer,Top 50 (Comm),https://www.generali.co.uk/Media.html,Dynamic JS,Medium - Employee Benefits,a.news-link
+SCOR,Insurer,Reinsurer,https://www.scor.com/en/press-releases-and-news,Dynamic JS,Critical - Reinsurance Cap,a.news-item-link
+Swiss Re,Insurer,Reinsurer,https://www.swissre.com/media/news-releases.html,Dynamic JS,Critical - Catastrophe Models,a.news-link
+Munich Re,Insurer,Reinsurer,https://www.munichre.com/en/company/media-relations/media-information-and-corporate-news.html,Dynamic JS,Critical - Climate Risk,a.teaser-link
+Lloyd's of London,Market Body,Market,https://www.lloyds.com/insights/media-centre/press-releases,Dynamic JS,Critical - Systemic Risk,a.search-result-link
+Saga PLC,Insurer,Niche (Age),https://corporate.saga.co.uk/news/regulatory-news/,Dynamic JS,High - Over 50s Trends,a.news-link
+Domestic & General,Insurer,Niche (Warranty),https://www.domesticandgeneral.com/about-us/media-centre,Dynamic JS,High - Appliance Repairs,a.news-link
+First Central,Insurer,Broker/MGA,https://www.1stcentralintermediaries.com/news/,Dynamic JS,Medium - Broker News,a.news-link
+Markerstudy,Insurer,MGA,https://www.markerstudy.com/news,Dynamic JS,High - Capacity/M&A,a.news-link
+Tesco Bank,Insurer,Retail,https://www.tescobank.com/corporate/media/press-releases/,Dynamic JS,Medium - Mass Market,a.news-link
+Sainsbury's Bank,Insurer,Retail,https://www.sainsburysbank.co.uk/about-us/media-centre/press-releases,Dynamic JS,Medium - Mass Market,a.news-link
+Co-op Insurance,Insurer,Retail,https://www.co-operative.coop/media/news-releases,Dynamic JS,Medium - Ethical/Community,a.news-link
+Aegon UK,Insurer,Life,https://www.aegon.co.uk/media-centre/news.press-releases-b2b-media,Dynamic JS,Low - Platform News,a.news-link
+Marsh UK,Broker,Top 5,https://www.marsh.com/en-gb/about/media/press-releases.html,Dynamic JS,Critical - Global Rates,a.card-link
+Aon UK,Broker,Top 5,https://aon.mediaroom.com/news-releases?t=1&l=en-GB,Dynamic JS,Critical - Reinsurance,a.item-link
+Gallagher UK,Broker,Top 5,https://www.ajg.com/uk/news-and-insights/,Dynamic JS,Critical - Regional UK,a.card-link
+Howden Group,Broker,Top 5,https://www.howdengroup.com/uk-en/news-insights,Dynamic JS,Critical - Cyber/M&A,a.card-link
+WTW (Willis),Broker,Top 5,https://www.wtwco.com/en-gb/news/list,Dynamic JS,Critical - Actuarial,a.card-link
+Ardonagh Group,Broker,Top 10,https://www.ardonagh.com/media-centre/press-releases/,Dynamic JS,Medium - Consolidator,h3.post-title a
+Towergate,Broker,Top 10,https://www.towergate.com/news,Dynamic JS,High - Care/SME,a.news-link
+Lockton UK,Broker,Top 10,https://global.lockton.com/gb/en/news-insights,Dynamic JS,High - PI/Real Estate,a.card-link
+PIB Group,Broker,Top 20,https://www.pibgroup.co.uk/news,Dynamic JS,Low - M&A,a.news-link
+BMS Group,Broker,Top 20,https://www.bmsgroup.com/news,Dynamic JS,Medium - Specialty,a.news-link
+Miller Insurance,Broker,Top 20,https://www.miller-insurance.com/News-and-Insights,Dynamic JS,High - Marine/Energy,a.card-link
+Tysers,Broker,Top 20,https://www.tysers.com/news-insights/,Dynamic JS,High - Entertainment,h3.post-title a
+Griffiths & Armour,Broker,Specialist,https://www.griffithsandarmour.com/news/,Dynamic JS,Critical - Prof Indemnity,h3.entry-title a
+Aston Lark,Broker,Top 20,https://www.astonlark.com/news-and-views/,Dynamic JS,High - HNW,h3.post-title a
+Clear Group,Broker,Top 50,https://www.thecleargroup.com/news,Dynamic JS,Medium - SME,h3.news-title a
+Partners&,Broker,Top 50,https://www.partnersand.com/insights/,Dynamic JS,Medium - Advisory,h3.post-title a
+Specialist Risk Group,Broker,Top 50,https://specialistriskgroup.com/news/,Dynamic JS,High - Niche Risks,a.news-link
+GRP (Brown & Brown),Broker,Top 20,https://www.grpgroup.co.uk/news/,Dynamic JS,Low - M&A,a.news-link
+Brown & Brown EU,Broker,Top 20,https://www.bbrown.com/uk/news-events/,Dynamic JS,Medium - Corporate,h2.entry-title a
+Simply Business,Broker,Digital,https://www.simplybusiness.co.uk/knowledge/,Dynamic JS,Critical - Micro-SME,h3.card__title a
+McGill and Partners,Broker,Boutique,https://www.mcgillpartners.com/insights/,Dynamic JS,Critical - Aviation/Complex,a.insight-card__link
+Adrian Flux,Broker,Specialist,https://www.adrianflux.co.uk/blog/,Dynamic JS,Critical - Non-Standard Motor,h2.entry-title a
+BPL Global,Broker,Specialist,https://www.bpl-global.com/news-and-views/,Dynamic JS,High - Trade Credit,h3.entry-title a
+Hamilton Fraser,Broker,Specialist,https://www.hamiltonfraser.co.uk/knowledge/news,Dynamic JS,High - Landlord/Medical,a.card-link
+James Hallam,Broker,Top 50,https://jameshallam.co.uk/news/,Dynamic JS,Medium - Hospitality,h2.eut-post-title a
+Lycetts,Broker,Specialist,https://www.lycetts.co.uk/insights/,Dynamic JS,High - Farm/Estates,a.button--primary
+Romero Insurance,Broker,Top 50,https://romeroinsurance.co.uk/news/,Dynamic JS,Medium - Construction,h2.elementor-heading-title a
